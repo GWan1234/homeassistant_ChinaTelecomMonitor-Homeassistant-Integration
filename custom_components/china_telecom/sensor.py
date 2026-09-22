@@ -39,14 +39,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
     else:
         device_id = entry.data[CONF_DEVICE_ID]
 
-    coordinator = ChinaTelecomDataUpdateCoordinator(
-        hass, entry, phonenum, password  
-    )
-    await coordinator.async_refresh()
-
-    if not coordinator.last_update_success:
-        _LOGGER.error("Failed to fetch initial China Telecom data. Integration will not set up.")
-        return
+    coordinator = ChinaTelecomDataUpdateCoordinator(hass, entry, phonenum, password)
+    await coordinator.async_config_entry_first_refresh()
 
     masked_phonenum = f"{phonenum[:3]}****{phonenum[7:]}"
 
@@ -96,7 +90,7 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
         ).strip()
         self.update_interval_minutes = self._get_update_interval_minutes(entry)
         self._login_attempts = hass.data.setdefault(DOMAIN, {}).setdefault("login_attempts", {})
-        self.telecom = Telecom() # 实例化 Telecom 类
+        self.telecom = None
         super().__init__(
             hass,
             _LOGGER,
@@ -128,6 +122,12 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
     def _response_inner_data(self, payload):
         data = self._response_data(payload).get("data")
         return data if isinstance(data, dict) else {}
+
+    async def _async_get_telecom(self):
+        """Return the Telecom client, creating it outside the event loop."""
+        if self.telecom is None:
+            self.telecom = await self.hass.async_add_executor_job(Telecom)
+        return self.telecom
 
     def _extract_error_msg(self, payload, default):
         if not isinstance(payload, dict):
@@ -166,6 +166,11 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
         response_data = self._response_data(payload)
         return header_infos.get("code") == "X201" or response_data.get("resultCode") == "X201"
 
+    def _should_cooldown_login(self, payload):
+        """Cooldown only for explicit server-side challenges that need user action."""
+        response_data = self._response_data(payload)
+        return response_data.get("resultCode") in {"3005", "3006"}
+
     def _login_cooldown_remaining_seconds(self):
         last_attempt = self._login_attempts.get(self.entry.entry_id)
         if last_attempt is None:
@@ -176,14 +181,19 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
         return max(0, int(cooldown_seconds - elapsed_seconds))
 
     def _log_payload(self, message, payload):
+        if self.telecom is None:
+            payload_for_log = str(payload)
+        else:
+            payload_for_log = self.telecom.format_for_log(payload)
         _LOGGER.error(
             "%s for %s: %s",
             message,
             self.masked_phonenum,
-            self.telecom.format_for_log(payload),
+            payload_for_log,
         )
 
     async def _process_important_data(self, important_data_raw):
+        telecom = await self._async_get_telecom()
         important_data = self._response_inner_data(important_data_raw)
 
         flow_info = important_data.get("flowInfo")
@@ -205,7 +215,7 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
             return dict(self.data)
 
         summary_data = await self.hass.async_add_executor_job(
-            self.telecom.to_summary, important_data, self.phonenum
+            telecom.to_summary, important_data, self.phonenum
         )
 
         processed_data = {
@@ -214,15 +224,15 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
             "voiceUsage": summary_data.get("voiceUsage", 0),
             "voiceBalance": summary_data.get("voiceBalance", 0),
             "voiceTotal": summary_data.get("voiceTotal", 0),
-            "flowUse": round(self.telecom.convert_flow(summary_data.get("flowUse", 0), "GB", 2), 2),
-            "flowTotal": round(self.telecom.convert_flow(summary_data.get("flowTotal", 0), "GB", 2), 2),
-            "flowBalance": round(self.telecom.convert_flow(summary_data.get("flowTotal", 0) - summary_data.get("flowUse", 0), "GB", 2), 2),
-            "flowOver": round(self.telecom.convert_flow(summary_data.get("flowOver", 0), "GB", 2), 2),
-            "commonUse": round(self.telecom.convert_flow(summary_data.get("commonUse", 0), "GB", 2), 2),
-            "commonTotal": round(self.telecom.convert_flow(summary_data.get("commonTotal", 0), "GB", 2), 2),
-            "commonOver": round(self.telecom.convert_flow(summary_data.get("commonOver", 0), "GB", 2), 2),
-            "specialUse": round(self.telecom.convert_flow(summary_data.get("specialUse", 0), "GB", 2), 2),
-            "specialTotal": round(self.telecom.convert_flow(summary_data.get("specialTotal", 0), "GB", 2), 2),
+            "flowUse": round(telecom.convert_flow(summary_data.get("flowUse", 0), "GB", 2), 2),
+            "flowTotal": round(telecom.convert_flow(summary_data.get("flowTotal", 0), "GB", 2), 2),
+            "flowBalance": round(telecom.convert_flow(summary_data.get("flowTotal", 0) - summary_data.get("flowUse", 0), "GB", 2), 2),
+            "flowOver": round(telecom.convert_flow(summary_data.get("flowOver", 0), "GB", 2), 2),
+            "commonUse": round(telecom.convert_flow(summary_data.get("commonUse", 0), "GB", 2), 2),
+            "commonTotal": round(telecom.convert_flow(summary_data.get("commonTotal", 0), "GB", 2), 2),
+            "commonOver": round(telecom.convert_flow(summary_data.get("commonOver", 0), "GB", 2), 2),
+            "specialUse": round(telecom.convert_flow(summary_data.get("specialUse", 0), "GB", 2), 2),
+            "specialTotal": round(telecom.convert_flow(summary_data.get("specialTotal", 0), "GB", 2), 2),
             "points": summary_data.get("points", 0),
             "lastUpdate": datetime.now().astimezone().isoformat(timespec="seconds")
             if has_package_data
@@ -245,6 +255,7 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
         return processed_data
 
     async def _try_cached_login_info(self):
+        telecom = await self._async_get_telecom()
         cached_login_info = self.entry.data.get(CONF_LOGIN_INFO)
         if not isinstance(cached_login_info, dict):
             return None
@@ -255,11 +266,11 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
         cached_login_info = {**cached_login_info}
         cached_login_info["phonenum"] = self.phonenum
         cached_login_info["password"] = self.password
-        self.telecom.set_login_info(cached_login_info)
+        telecom.set_login_info(cached_login_info)
         _LOGGER.debug("Trying cached China Telecom token for %s.", self.masked_phonenum)
 
         important_data_raw = await self.hass.async_add_executor_job(
-            self.telecom.qry_important_data
+            telecom.qry_important_data
         )
         if self._response_inner_data(important_data_raw):
             _LOGGER.debug("Successfully fetched China Telecom data with cached token for %s.", self.masked_phonenum)
@@ -268,7 +279,7 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
         error_msg = self._extract_error_msg(important_data_raw, "缓存 token 不可用")
         if self._is_token_expired(important_data_raw):
             _LOGGER.warning("Cached China Telecom token expired for %s: %s", self.masked_phonenum, error_msg)
-            _LOGGER.debug("Cached token expired response for %s: %s", self.masked_phonenum, self.telecom.format_for_log(important_data_raw))
+            _LOGGER.debug("Cached token expired response for %s: %s", self.masked_phonenum, telecom.format_for_log(important_data_raw))
             return None
 
         _LOGGER.error("Cached China Telecom token query failed for %s: %s", self.masked_phonenum, error_msg)
@@ -285,6 +296,7 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
         self.hass.config_entries.async_update_entry(self.entry, data=new_data)
 
     async def _login_and_store(self, reason):
+        telecom = await self._async_get_telecom()
         remaining_seconds = self._login_cooldown_remaining_seconds()
         if remaining_seconds > 0:
             remaining_minutes = max(1, (remaining_seconds + 59) // 60)
@@ -292,15 +304,14 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
                 f"Login skipped: 登录冷却中，请约 {remaining_minutes} 分钟后重试。原因: {reason}"
             )
 
-        self._login_attempts[self.entry.entry_id] = time.monotonic()
         _LOGGER.warning(
-            "China Telecom token unavailable for %s (%s). Performing one login; next login is cooled down for %s minutes.",
+            "China Telecom token unavailable for %s (%s). Attempting login; explicit verification failures are cooled down for %s minutes.",
             self.masked_phonenum,
             reason,
             LOGIN_RETRY_COOLDOWN_MINUTES,
         )
         login_result = await self.hass.async_add_executor_job(
-            self.telecom.do_login,
+            telecom.do_login,
             self.phonenum,
             self.password,
             self.telecom_device_id,
@@ -308,6 +319,10 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
 
         login_response_data = self._response_data(login_result)
         if login_response_data.get("resultCode") != "0000":
+            if self._should_cooldown_login(login_result):
+                self._login_attempts[self.entry.entry_id] = time.monotonic()
+            else:
+                self._login_attempts.pop(self.entry.entry_id, None)
             error_msg = self._extract_error_msg(login_result, "未知登录失败")
             _LOGGER.error(f"Login failed for {self.masked_phonenum}: {error_msg}")
             self._log_payload("China Telecom login response", login_result)
@@ -320,7 +335,7 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
 
         login_info["phonenum"] = self.phonenum
         login_info["password"] = self.password
-        self.telecom.set_login_info(login_info)
+        telecom.set_login_info(login_info)
         self._store_login_info(login_info)
         _LOGGER.debug(f"Successfully logged in for {self.masked_phonenum}.")
         return login_result
@@ -335,10 +350,11 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
                 return cached_data
 
             login_result = await self._login_and_store("没有可用缓存 token 或缓存 token 已过期")
+            telecom = await self._async_get_telecom()
 
             # 获取重要数据
             important_data_raw = await self.hass.async_add_executor_job(
-                self.telecom.qry_important_data
+                telecom.qry_important_data
             ) 
 
             if self._response_inner_data(important_data_raw):
@@ -425,7 +441,7 @@ class ChinaTelecomSensor(Entity):
             "manufacturer": "中国电信",
             "entry_type": DeviceEntryType.SERVICE,
             "model": "CTM中国电信", 
-            "sw_version": "1.1.6" 
+            "sw_version": "1.1.7" 
         }
 
     @property
